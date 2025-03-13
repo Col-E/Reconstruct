@@ -2,17 +2,14 @@ package me.darknet.resconstruct;
 
 import me.coley.analysis.SimAnalyzer;
 import me.coley.analysis.SimInterpreter;
-import me.coley.analysis.TypeChecker;
 import me.coley.analysis.TypeResolver;
-import me.coley.analysis.util.InheritanceGraph;
-import me.coley.analysis.util.TypeUtil;
 import me.darknet.resconstruct.analysis.StackCopyingSimAnalyser;
+import me.darknet.resconstruct.util.AbstractResolverBuilder;
+import me.darknet.resconstruct.util.GraphResolverBuilder;
 import me.darknet.resconstruct.solvers.InheritanceSolver;
 import me.darknet.resconstruct.solvers.InstructionsSolver;
-import me.darknet.resconstruct.util.InheritanceUtils;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
-import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FrameNode;
 
@@ -22,11 +19,10 @@ import java.util.NavigableMap;
 
 public class Reconstruct {
 	private final Map<String, ClassReader> inputs = new HashMap<>();
+	private final AbstractResolverBuilder graphBuilder = newGraphHelper();
 	private ClassHierarchy hierarchy;
-	private InheritanceGraph graph;
 	private boolean ignoreSolveExceptions;
-	private TypeResolver typeResolver;
-
+	private int api = Opcodes.ASM9;
 
 	/**
 	 * New instance.
@@ -47,6 +43,16 @@ public class Reconstruct {
 	}
 
 	/**
+	 * Set the ASM API version for the backing interpreter to use.
+	 *
+	 * @param api
+	 * 		ASM API version.
+	 */
+	public void setApi(int api) {
+		this.api = api;
+	}
+
+	/**
 	 * Adds a class to the input.
 	 * Each input will be scanned for references, of which will be analyzed in {@link #run()}.
 	 *
@@ -57,7 +63,9 @@ public class Reconstruct {
 		ClassReader cr = new ClassReader(classFile);
 		inputs.put(cr.getClassName(), cr);
 		hierarchy.createInputPhantom(cr);
-		graph.addClass(classFile);
+		if (graphBuilder instanceof GraphResolverBuilder) {
+			((GraphResolverBuilder) graphBuilder).addClass(classFile);
+		}
 	}
 
 	/**
@@ -65,25 +73,7 @@ public class Reconstruct {
 	 */
 	public void reset() {
 		hierarchy = new ClassHierarchy();
-		graph = InheritanceUtils.getClasspathGraph().copy();
 		inputs.clear();
-		this.typeResolver = new TypeResolver() {
-			@Override
-			public Type common(Type type1, Type type2) {
-				String common = graph.getCommon(type1.getInternalName(), type2.getInternalName());
-				if (common != null)
-					return Type.getObjectType(common);
-				return TypeUtil.OBJECT_TYPE;
-			}
-
-			@Override
-			public Type commonException(Type type1, Type type2) {
-				String common = graph.getCommon(type1.getInternalName(), type2.getInternalName());
-				if (common != null)
-					return Type.getObjectType(common);
-				return TypeUtil.EXCEPTION_TYPE;
-			}
-		};
 	}
 
 	/**
@@ -93,6 +83,7 @@ public class Reconstruct {
 		// Initial pass to generate base phantom types
 		for (ClassReader cr : inputs.values())
 			cr.accept(new PhantomVisitor(Opcodes.ASM9, null, this), ClassReader.SKIP_FRAMES);
+
 		// Second pass to flesh out phantom types
 		for (ClassReader cr : inputs.values()) {
 			ClassNode classNode = new ClassNode();
@@ -105,9 +96,41 @@ public class Reconstruct {
 					throw ex;
 			}
 		}
+
 		// Third pass sort inheritance and do interface solving
 		InheritanceSolver solver = new InheritanceSolver();
 		solver.solve(hierarchy, null);
+	}
+
+	/**
+	 * <b>Note:</b> Each method should be given its own analyzer instance.
+	 *
+	 * @return New analyzer instance.
+	 */
+	public SimAnalyzer newAnalyzer(NavigableMap<Integer, FrameNode> stackFrames) {
+		SimInterpreter interpreter = new SimInterpreter(api);
+		SimAnalyzer analyzer = new StackCopyingSimAnalyser(stackFrames, interpreter) {
+			@Override
+			public TypeResolver createTypeResolver() {
+				return graphBuilder.get();
+			}
+		};
+		analyzer.setThrowUnresolvedAnalyzerErrors(false);
+		return analyzer;
+	}
+
+	/**
+	 * @return New graph helper.
+	 */
+	protected AbstractResolverBuilder newGraphHelper() {
+		return new GraphResolverBuilder();
+	}
+
+	/**
+	 * @return Type resolver.
+	 */
+	public TypeResolver getTypeResolver() {
+		return graphBuilder.get();
 	}
 
 	/**
@@ -120,29 +143,6 @@ public class Reconstruct {
 	}
 
 	/**
-	 * <b>Note:</b> Each method should be given its own analyzer instance.
-	 *
-	 * @return New analyzer instance.
-	 */
-	public SimAnalyzer newAnalyzer(NavigableMap<Integer, FrameNode> stackFrames) {
-		SimInterpreter interpreter = new SimInterpreter();
-		SimAnalyzer analyzer = new StackCopyingSimAnalyser(stackFrames, interpreter) {
-			@Override
-			public TypeChecker createTypeChecker() {
-				return (parent, child) -> graph.getAllParents(child.getInternalName())
-						.contains(parent.getInternalName());
-			}
-
-			@Override
-			public TypeResolver createTypeResolver() {
-				return typeResolver;
-			}
-		};
-		analyzer.setThrowUnresolvedAnalyzerErrors(false);
-		return analyzer;
-	}
-
-	/**
 	 * @return Output class hierarchy.
 	 */
 	public ClassHierarchy getHierarchy() {
@@ -150,20 +150,9 @@ public class Reconstruct {
 	}
 
 	/**
-	 * @return Inheritance information for classes.
-	 */
-	public InheritanceGraph getGraph() {
-		return graph;
-	}
-
-	/**
 	 * @return Map of inputs classes.
 	 */
 	public Map<String, ClassReader> getInputs() {
 		return inputs;
-	}
-
-	public TypeResolver getTypeResolver() {
-		return typeResolver;
 	}
 }

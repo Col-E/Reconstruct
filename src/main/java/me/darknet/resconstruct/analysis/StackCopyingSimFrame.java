@@ -2,7 +2,6 @@ package me.darknet.resconstruct.analysis;
 
 import me.coley.analysis.SimFrame;
 import me.coley.analysis.SimInterpreter;
-import me.coley.analysis.TypeChecker;
 import me.coley.analysis.TypeResolver;
 import me.coley.analysis.util.InsnUtil;
 import me.coley.analysis.util.TypeUtil;
@@ -27,9 +26,12 @@ import java.util.NavigableMap;
 public class StackCopyingSimFrame extends SimFrame {
 	private static final Type TOP_TYPE = Type.VOID_TYPE;
 	private final NavigableMap<Integer, FrameNode> stackFrames;
+	private final Type ownerType;
 	private StackCopyingSimFrame lastInitted;
 
 	/**
+	 * @param ownerType
+	 * 		Internal name of the class declaring the analyzed method.
 	 * @param stackFrames
 	 * 		Map of stack frames supplied by {@code StackMapTable}.
 	 * 		Only keyframes included, so we use {@link NavigableMap} to do floor lookups.
@@ -38,20 +40,24 @@ public class StackCopyingSimFrame extends SimFrame {
 	 * @param numStack
 	 * 		Maximum stack size of the frame.
 	 */
-	public StackCopyingSimFrame(NavigableMap<Integer, FrameNode> stackFrames, int numLocals, int numStack) {
+	public StackCopyingSimFrame(String ownerType, NavigableMap<Integer, FrameNode> stackFrames, int numLocals, int numStack) {
 		super(numLocals, numStack);
+		this.ownerType = Type.getObjectType(ownerType);
 		this.stackFrames = stackFrames;
 	}
 
 	/**
+	 * @param ownerType
+	 * 		Internal name of the class declaring the analyzed method.
 	 * @param stackFrames
 	 * 		Map of stack frames supplied by {@code StackMapTable}.
 	 * 		Only keyframes included, so we use {@link NavigableMap} to do floor lookups.
 	 * @param frame
 	 * 		Old frame.
 	 */
-	public StackCopyingSimFrame(NavigableMap<Integer, FrameNode> stackFrames, SimFrame frame) {
+	public StackCopyingSimFrame(String ownerType, NavigableMap<Integer, FrameNode> stackFrames, SimFrame frame) {
 		super(frame);
+		this.ownerType = Type.getObjectType(ownerType);
 		this.stackFrames = stackFrames;
 	}
 
@@ -61,9 +67,11 @@ public class StackCopyingSimFrame extends SimFrame {
 		// But the interpreter is operating off of a single frame which gets constantly updated.
 		// That frame is passed to us, so we call it the 'executing' frame.
 		StackCopyingSimFrame executingFrame = (StackCopyingSimFrame) frame;
+
 		// We need to tell the executing frame to enrich data in 'this' frame,
 		// so we pass it a reference to ourselves. It will be used in 'execute' below.
 		executingFrame.lastInitted = this;
+
 		return super.init(frame);
 	}
 
@@ -80,8 +88,10 @@ public class StackCopyingSimFrame extends SimFrame {
 			super.execute(insn, interpreter);
 			return;
 		}
+
 		// From here on, we have stack-map information.
 		int frameIndex = entry.getKey();
+
 		// Sanity check frame type, we use 'ClassReader.EXPAND_FRAMES' so the frames should always
 		// be in expanded form, which effectively makes them operate like a FULL frame, even if the
 		// frame type in the bytecode is something like APPEND.
@@ -91,7 +101,7 @@ public class StackCopyingSimFrame extends SimFrame {
 			throw new AnalyzerException(insn, "Invalid stack map frame, expected: F_NEW");
 		SimInterpreter simInterpreter = (SimInterpreter) interpreter;
 		TypeResolver typeResolver = simInterpreter.getTypeResolver();
-		TypeChecker typeChecker = simInterpreter.getTypeChecker();
+
 		// Update stack information. We can only do this for the first executed instruction in a block.
 		// The frame entry in the StackMapTable only tells us about the stack's state in the beginning.
 		// Though, the interpreter should propagate information we provide here.
@@ -100,34 +110,42 @@ public class StackCopyingSimFrame extends SimFrame {
 			int stackMax = Math.min(getMaxStackSize(), frame.stack.size());
 			for (int i = 0; i < stackMax; i++) {
 				AbstractValue value = getStack(i);
+
 				// We only care about object/virtual values
 				if (value instanceof VirtualValue) {
 					// Get the type in the stack-frame at the current index.
 					// The 'local' value should be the internal name of the type.
 					Type frameType = Type.getObjectType((String) frame.stack.get(i));
+
 					// Get the type value as recognized by SimAnalyzer for the stack value.
 					VirtualValue virtual = (VirtualValue) value;
 					Type currentType = virtual.getType();
+
 					// Compute which type is the 'best' and use that.
 					// If it is the same as the current type, we do not need to do anything.
 					Type targetType = TypeUtils.computeBestType(currentType, frameType, typeResolver);
 					if (targetType.equals(currentType))
 						continue;
+
 					// Create a copy value but with the new type.
 					VirtualValue newValue =
-							VirtualValue.ofVirtual(virtual.getInsns(), typeChecker, targetType, virtual.getValue());
+							VirtualValue.ofVirtual(virtual.getInsns(), typeResolver, targetType, virtual.getValue());
+
 					// Updating 'this' frame will update what the interpreter operates off of since this is the frame
 					// the interpreter is using as its 'executing frame'.
 					setStack(i, newValue);
+
 					// Updating the last initialized frame updates the information that will be returned by the
 					// SimAnalyzer's "analyze(...)" method.
 					lastInitted.setStack(i, newValue);
 				}
 			}
 		}
+
 		// Now that we have updated the type information of things on the stack, we can continue execution
 		// using the updated values.
 		super.execute(insn, interpreter);
+
 		// Update local variable information
 		int wideCount = 0;
 		for (int i = 0; i < frame.local.size(); i++) {
@@ -135,30 +153,37 @@ public class StackCopyingSimFrame extends SimFrame {
 			if (wideCount < 0)
 				throw new AnalyzerException(frame, "Frame's StackMapTable yielded data causing estimated" +
 						" wide conversion offset to go negative");
+
 			// The index in the "locals" of an ASM stack analysis frame must account for wide types.
 			// So we will adjust for it here. We do not need to do so for stack-frames since they
 			// do not account for wide types and their reserved slots.
 			AbstractValue value = getLocal(i + wideCount);
+
 			// Get the type in the stack-frame at the current index.
 			// The 'local' value should be the internal name of the type.
 			Type frameLocalType = getFrameLocalType(frame, i);
+
 			// We only care about object/virtual values for type solving
 			if (value instanceof VirtualValue) {
 				// Get the type value as recognized by SimAnalyzer for the local variable.
 				VirtualValue virtual = (VirtualValue) value;
 				Type currentType = virtual.getType();
+
 				// Compute which type is the 'best' and use that.
 				// If it is the same as the current type, we do not need to do anything.
 				Type targetType = TypeUtils.computeBestType(currentType, frameLocalType, typeResolver);
 				if (targetType.equals(currentType))
 					continue;
+
 				// Create a copy value but with the new type.
 				VirtualValue newValue =
-						VirtualValue.ofVirtual(virtual.getInsns(), typeChecker, targetType, virtual.getValue());
+						VirtualValue.ofVirtual(virtual.getInsns(), typeResolver, targetType, virtual.getValue());
+
 				// Updating 'this' frame (the executing frame) ensures things like 'ALOAD list' will properly
 				// get the type even of things SimAnalyzer isn't aware of, so long as it is present in the
 				// StackMapTable.
 				setLocal(i, newValue);
+
 				// Updating the last initialized frame updates the information that will be returned by the
 				// SimAnalyzer's "analyze(...)" method.
 				lastInitted.setLocal(i, newValue);
@@ -166,6 +191,7 @@ public class StackCopyingSimFrame extends SimFrame {
 				// Need to offset wide count differences between ASM stack analysis frame,
 				// and the StackMapTable frame.
 				wideCount++;
+
 				// If the StackMapTable's frame is 'top' then we don't need to offset.
 				// I don't understand why, but sometimes this data exists, sometimes it does not.
 				// The spec says:
@@ -181,7 +207,7 @@ public class StackCopyingSimFrame extends SimFrame {
 		}
 	}
 
-	private static Type getFrameLocalType(FrameNode frame, int index) {
+	private Type getFrameLocalType(FrameNode frame, int index) {
 		Object frameLocal = frame.local.get(index);
 		Type frameLocalType;
 		if (frameLocal instanceof Integer) {
@@ -209,8 +235,7 @@ public class StackCopyingSimFrame extends SimFrame {
 					frameLocalType = TypeUtil.OBJECT_TYPE;
 					break;
 				case 6: // ITEM_UNINITIALIZED_THIS
-					// TODO: Use declaring type of method instead
-					frameLocalType = TypeUtil.OBJECT_TYPE;
+					frameLocalType = ownerType;
 					break;
 				case 9: // ITEM_ASM_BOOLEAN
 					frameLocalType = Type.BOOLEAN_TYPE;

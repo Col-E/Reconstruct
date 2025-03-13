@@ -28,10 +28,12 @@ public class InheritanceUtils {
 		// Not an object? Must be JVM type.
 		if (type.getSort() != Type.OBJECT)
 			return true;
+
 		// Object check
 		String internalName = type.getInternalName();
 		if (internalName.equals("java/lang/Object"))
 			return true;
+
 		// If the graph has lookups for the type, it belongs to the classpath
 		return GRAPH_CP.hasChildrenLookup(internalName) || GRAPH_CP.hasParentLookup(internalName);
 	}

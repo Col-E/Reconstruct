@@ -5,6 +5,8 @@ import me.coley.analysis.SimFrame;
 import me.coley.analysis.SimInterpreter;
 import me.coley.analysis.value.AbstractValue;
 import org.objectweb.asm.tree.FrameNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.analysis.AnalyzerException;
 import org.objectweb.asm.tree.analysis.Frame;
 
 import java.util.NavigableMap;
@@ -14,6 +16,7 @@ import java.util.NavigableMap;
  */
 public class StackCopyingSimAnalyser extends SimAnalyzer {
 	private final NavigableMap<Integer, FrameNode> stackFrames;
+	private String currentOwner;
 
 	/**
 	 * Create analyzer.
@@ -30,12 +33,18 @@ public class StackCopyingSimAnalyser extends SimAnalyzer {
 	}
 
 	@Override
+	public SimFrame[] analyze(String owner, MethodNode method) throws AnalyzerException {
+		this.currentOwner = owner;
+		return super.analyze(owner, method);
+	}
+
+	@Override
 	protected SimFrame newFrame(Frame<? extends AbstractValue> frame) {
-		return new StackCopyingSimFrame(stackFrames, (SimFrame) frame);
+		return new StackCopyingSimFrame(currentOwner, stackFrames, (SimFrame) frame);
 	}
 
 	@Override
 	protected SimFrame newFrame(int numLocals, int numStack) {
-		return new StackCopyingSimFrame(stackFrames, numLocals, numStack);
+		return new StackCopyingSimFrame(currentOwner, stackFrames, numLocals, numStack);
 	}
 }
